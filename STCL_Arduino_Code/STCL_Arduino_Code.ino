@@ -1,22 +1,58 @@
+#define LOW_THRESHOLD 100 // Minimum value of the incoming peak that stops the peak sampling 
+#define HIGH_THRESHOLD 180 //Minimum value of the incoming peak that triggers the peak sampling 
+// Note that the threshold window should not be too wide for noise reduction purpose
+#define CAVITY_P_GAIN (0 * 0.004) // Proportional gain for the cavity PZT
+#define CAVITY_I_GAIN (2 * 0.001) // Integral gain for the cavity PZT
+#define LASER_P_GAIN (0.2 * 0.001) // Proportional gain for the laser
+#define LASER_I_GAIN (0.25 * 0.01) // Integral gain for the laser
+float LASER_REFERENCE_MOT = 690200; // The setpoint of the frequency lock
+const boolean find_setpoint = 0; // Set to 1 to run in the setpoint finder mode
+const boolean serial_print = 1; // Set to 1 to print the output values to the serial monitor; only valid when find_setpoint = 0
+const boolean i2c_debug = 0; // Set to 1 to print the I2C data to the serial monitor
+const boolean average_enable = 0; // Set to 1 to print an averaged setpoint value; only valid when find_setpoint = 1
+const int average_samplenum = 1000; // The number of samples to be averaged; only valid when average_enable = 1
+
+//####################################################################################
+// Above are all the parameters that aimed to be tuned for calibration and debugging
+//####################################################################################
+
+
+
 #define BUFFER_SIZE  256//Buffer size for each of the 3 peaks 
 #define TIME_SIZE 6// There is going to be 6 start time and stop time for sampling. 2 for each peak
-#define LOW_THRESHOLD 100// Minimum value of the incoming peak that stops the sampling 
-#define HIGH_THRESHOLD 180//Minimum value of the incoming peak that triggers the sampling 
 /*Change these threshold values to compensate the noise*/
 #define THRESHOLD_GAP (HIGH_THRESHOLD-LOW_THRESHOLD)
-#define CAVITY_REFERENCE 200000//t_M that sets the lockpoint for the cavity
+#define CAVITY_REFERENCE 100000//t_M that sets the lockpoint for the cavity
 #define CAVITY_DACC_OFFSET 2048
 #define LASER_DACC_OFFSET 2048
 #define HALF_RANGE 2047
+
+union Float_convert
+{
+   uint8_t byte[4];
+   float real;
+};
+
+union Int_convert
+{
+   uint8_t byte[2];
+   uint16_t real;
+};
+
+
 float setpoint_change_factor = -341.2;//(beta^-1)*10^6. You can calcuate this using the cavity properties or calibrate through atomic constant measurements like A_{HFS}
-float LASER_REFERENCE_MOT = 298500+(4)*22338+(9.9+5.3-1.3-2-4.68-3.2)*setpoint_change_factor;//10^6*r that sets the slave laser setpoint during the 2D MOT stage
-volatile float LASER_REFERENCE = LASER_REFERENCE_MOT; //10^6*r that sets the slave laser setpoint
+volatile float LASER_REFERENCE = find_setpoint ? 0 : LASER_REFERENCE_MOT; //10^6*r that sets the slave laser setpoint
 
 //Define variables that allow for scanning the frequency
-volatile uint16_t steps = 1;         // number of steps
+volatile uint16_t steps = 1  ;         // number of steps
 volatile uint16_t repeats = 1000;       // number of repeats
-volatile float start_frequency  =  0;  // Lower limit of the frequency scan (units of MHz)
-volatile float stop_frequency   = 0; // Upper limit of the frequency scan (units of MHz)
+
+volatile float pp  = 171.7;  // Bias=-3V
+volatile float pphigh  =510-5.8+3.5-2+2.2;  //Bias=-9V
+volatile float mphigh  =-505.12;  //Bias=-9V
+
+volatile float start_frequency  =0;//200;//-30;  // zero bias
+volatile float stop_frequency  = 0;//500;//=30;// 60 ;  // zero bias
 volatile uint16_t step_counter =0;//keeps the current step number
 volatile uint16_t repeat_counter = 0;//keeps the current repeat number
 float frequency_jump = (stop_frequency - start_frequency) / steps; //Units of MHz
@@ -55,6 +91,26 @@ int32_t cavity_control_signal = 0;
 int32_t laser_control_signal = 0;
 volatile uint16_t average = 1;
 boolean bump = LOW;//I use the bump to indicate if the cavity is locked(HIGH) or not(LOW).
+boolean is_broken = 0;
+int32_t laser_control_signal_recorder = 0;
+int32_t cavity_control_signal_recorder = 0;
+int16_t flash_counter=0;
+int16_t fast_flash_counter=0;
+boolean flashing_status=0;
+boolean fast_flashing_status=0;
+int16_t broken_counter=0;
+int16_t broken_counter_cavity=0;
+const uint16_t stringBufferSize = 11;
+uint8_t stringBuffer[stringBufferSize];
+boolean I2C_str_status = 0; // 0 to be start; 1 to be stop
+boolean I2C_status = 0;
+int32_t stringCounter = 0;
+Float_convert f1;
+Float_convert f2;
+Int_convert in1;
+// int test_c =0;
+float ramping_table[1024]={ 0. };
+volatile int ramping_num=0;
 
 
 //Define variable for acquiring the Start Time of the SysTick/Global Timer
@@ -63,16 +119,16 @@ volatile uint32_t start_time = 0;
 void setup()
 {
 
-  Serial.begin(57600);
+  if (serial_print||find_setpoint) Serial.begin(57600);
   adc_setup();
   global_digital_interrupt_setup();
   dacc_setup();
   setpoint_change_interrupt_setup();
-  
+  I2C_init();
+  pinMode(50,OUTPUT);
 }
 void loop()
 {
-
  if (counter == 0 && times[1])  //True when the M peak has been acquired
   {
     peakfinder_1();// Subroutine to process the M peak
@@ -88,7 +144,6 @@ void loop()
   {
     peakfinder_1();// Subroutine to process the M' peak
   }
-
 
 }
 void setpoint_change_interrupt_setup()
@@ -286,10 +341,14 @@ void PIOC_Handler()//Right now I am using the PIOC_handler from the internal fun
   }
   if ((PIOC->PIO_ISR & PIO_PC4) == PIO_PC4)
   {
-    cavity_K_p = 0.004;//Proportional Gain for the cavity PZT
-    cavity_K_i = 0.001;//Integral Gain for the cavity PZT
-    laser_K_i =0.01;//Proportional Gain for the laser PZT
-    laser_K_p =0.0075;//Integral Gain for the laser PZT
+    cavity_K_p = CAVITY_P_GAIN;//Proportional Gain for the cavity PZT
+    cavity_K_i = CAVITY_I_GAIN;//Integral Gain for the cavity PZT
+    laser_K_i = LASER_I_GAIN;//Proportional Gain for the laser PZT
+    laser_K_p = LASER_P_GAIN;//Integral Gain for the laser PZT 
+    if (find_setpoint) {
+      laser_K_i = 0;
+      laser_K_p = 0;
+      }
     bump = (HIGH && (!(bump)));
   }
 
@@ -303,38 +362,16 @@ void PIOC_Handler()//Right now I am using the PIOC_handler from the internal fun
 void PIOB_Handler()//This Handler processes TTL signals to perform jump in Slave laser frequency setpoint
 {
 
-  if ((PIOB->PIO_ISR & PIO_PB14 ) == PIO_PB14)
+  if ((PIOB->PIO_ISR & PIO_PB14 ) == PIO_PB14 && ramping_num > 0)
   {
-
-    if (step_counter <= steps)
-    {
-      if (!jump)
-      {
-        LASER_REFERENCE +=  setpoint_change_factor * (start_frequency + step_counter * frequency_jump);
-        jump = !jump;
-        step_counter++;
-      }
-      else
-      {
-        LASER_REFERENCE = LASER_REFERENCE_MOT;
-        jump = !jump;
-      }
-
+    if (serial_print) Serial.println("Triggered!");
+    if (step_counter < ramping_num){
+      LASER_REFERENCE = ramping_table[step_counter];
+      step_counter++;
+    }else{
+      step_counter = 0;
+      LASER_REFERENCE = ramping_table[0];
     }
-
-    else
-    {
-
-      if (repeat_counter <= repeats)
-      {
-        LASER_REFERENCE = LASER_REFERENCE_MOT;
-        step_counter = 0;
-        repeat_counter++;
-        jump=LOW;
-      }
-      
-    }
-    
   }
 
 
@@ -445,30 +482,178 @@ void DACC_Handler()
 
   cavity_error_signal_prev = cavity_error_signal_current;
   laser_error_signal_prev = laser_error_signal_current;
- /*
-  * Enable this section if you want to get the average slave laser setpoint and then print the average_laser_error_signal
-  if (average <= 1000)
+
+  // Enable this section if you want to get the average slave laser setpoint and then print the average_laser_error_signal
+ if (average_enable){
+  if (average <= average_samplenum)
   {
     sum_laser_error_signal += -laser_error_signal_current;
     average++;
   }
   else
   {
-    average_laser_error_signal = sum_laser_error_signal / 1000;
+    average_laser_error_signal = sum_laser_error_signal / average_samplenum;
     average = 1;
     sum_laser_error_signal = 0;
-   
   }
-  */
+ }
+
+  
   frequency_changed = (LASER_REFERENCE - LASER_REFERENCE_MOT) / setpoint_change_factor;
-  Serial.print(cavity_control_signal);
-  Serial.print(",");
-  Serial.print(laser_control_signal);
-  Serial.print(",");
-  Serial.print(frequency_changed);
-  //Serial.print(",");
-  //Serial.print(laser_error_signal_current);
-  Serial.println();
- 
+  if (find_setpoint){
+    if (average_enable) {
+      if (sum_laser_error_signal == 0) Serial.println(average_laser_error_signal);
+    }
+    else Serial.println(-laser_error_signal_current);
+  }else if (serial_print){
+    Serial.print(cavity_control_signal);
+    Serial.print(",");
+    Serial.print(laser_control_signal);
+    Serial.print(",");
+    Serial.print(frequency_changed);
+    Serial.println();
+  }
+  if (laser_control_signal_recorder){
+    if (laser_control_signal == laser_control_signal_recorder){
+      broken_counter ++;
+    }else{
+        broken_counter = 0;
+    }
+  }
+  if (broken_counter >50){
+    is_broken = 1;
+  }else{
+    is_broken = 0;
+  }
+  laser_control_signal_recorder = laser_control_signal;
+  cavity_control_signal_recorder = cavity_control_signal;
+  if (bump)
+  {
+    if (is_broken){
+        if (!fast_flash_counter){
+            digitalWrite(50,LOW);
+            fast_flashing_status = 0;
+        }else{
+            if (fast_flash_counter > 5){
+                fast_flashing_status = !fast_flashing_status;
+                digitalWrite(50,fast_flashing_status);
+                fast_flash_counter = 0;
+            }
+        }
+        fast_flash_counter ++;
+    }
+    else if (abs(laser_control_signal_recorder)>1500){
+        if (!flash_counter){
+            digitalWrite(50,LOW);
+            flashing_status = 0;
+        }else{
+            if (flash_counter > 200){
+                flashing_status = !flashing_status;
+                digitalWrite(50,flashing_status);
+                flash_counter = 0;
+            }
+        }
+        flash_counter ++;
+    }else{
+        digitalWrite(50,HIGH);
+        flash_counter = 0;
+    }
+  }
+  else{
+    digitalWrite(50,LOW);
+  }
+  if (I2C_str_status && i2c_debug){
+     printer();
+   I2C_str_status =0;
+ }
 }
 
+
+void I2C_init(){
+  PMC->PMC_PCER0 |= PMC_PCER0_PID22; 
+  pinMode(71, INPUT_PULLUP);
+  pinMode(70, INPUT_PULLUP);
+  PIO_Configure(
+					   g_APinDescription[PIN_WIRE1_SDA].pPort,
+					   g_APinDescription[PIN_WIRE1_SDA].ulPinType,
+					   g_APinDescription[PIN_WIRE1_SDA].ulPin,
+					   g_APinDescription[PIN_WIRE1_SDA].ulPinConfiguration);
+	PIO_Configure(
+					   g_APinDescription[PIN_WIRE1_SCL].pPort,
+					   g_APinDescription[PIN_WIRE1_SCL].ulPinType,
+					   g_APinDescription[PIN_WIRE1_SCL].ulPin,
+					   g_APinDescription[PIN_WIRE1_SCL].ulPinConfiguration);
+  NVIC_DisableIRQ(TWI0_IRQn);
+  NVIC_ClearPendingIRQ(TWI0_IRQn);
+  // NVIC_SetPriority(TWI0_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 3, 3));
+  NVIC_SetPriority(TWI0_IRQn, -3);
+  NVIC_EnableIRQ(TWI0_IRQn);
+  TWI0->TWI_PTCR = TWI_PTCR_RXTDIS | TWI_PTCR_TXTDIS;	// Disable PDC channel
+  TWI_ConfigureSlave(TWI0, 0x11);	// set to master mode
+  TWI0->TWI_IDR = TWI0 -> TWI_IMR;			// disable all interrupts
+  TWI0->TWI_CR = TWI_CR_MSDIS | TWI_CR_SVEN;
+  TWI0->TWI_IER = TWI_IER_SVACC;
+  TWI0->TWI_PTCR = TWI_PTCR_RXTDIS | TWI_PTCR_TXTDIS;
+}
+
+void TWI0_Handler() {
+  if (!I2C_status){
+    TWI0->TWI_RPR = (RwReg)stringBuffer;		
+    TWI0->TWI_RCR = stringBufferSize;
+    TWI0->TWI_RNPR = 0;
+    TWI0->TWI_RNCR = 0;
+    TWI0->TWI_PTCR = TWI_PTCR_RXTEN;
+    TWI0->TWI_IDR = TWI0 -> TWI_IMR;
+    TWI0->TWI_IER = TWI_IER_EOSACC;
+    I2C_status = 1;
+  }else{
+    TWI0->TWI_PTCR = TWI_PTCR_RXTDIS;
+    TWI0->TWI_IDR = TWI0 -> TWI_IMR;
+    TWI0->TWI_IER = TWI_IER_SVACC;
+    if (stringBuffer[10] == 17){
+      f1.byte[0] = stringBuffer[0];
+      f1.byte[1] = stringBuffer[1];
+      f1.byte[2] = stringBuffer[2];
+      f1.byte[3] = stringBuffer[3];
+      f2.byte[0] = stringBuffer[4];
+      f2.byte[1] = stringBuffer[5];
+      f2.byte[2] = stringBuffer[6];
+      f2.byte[3] = stringBuffer[7];
+      in1.byte[0] = stringBuffer[8];
+      in1.byte[1] = stringBuffer[9];
+      if (in1.real == 0){
+        LASER_REFERENCE_MOT = f1.real;
+        LASER_REFERENCE = LASER_REFERENCE_MOT;
+      }else if (f2.real < -1.){
+        if (in1.real == 30000){
+          step_counter = 0;
+          ramping_num = (int)f1.real;
+        }else{
+          ramping_table[in1.real-1] = f1.real;
+        }
+      }else{
+        start_frequency = f1.real;
+        frequency_jump = f2.real;
+        steps = in1.real;
+      }
+    }
+    I2C_str_status = 1;
+    I2C_status = 0;
+    // test_c ++;
+    TWI0 -> TWI_SR & TWI_SR_EOSACC;
+  }
+}
+
+void printer(){
+    for (int i=0;i<stringBufferSize;i++){
+      Serial.print(stringBuffer[i]);
+      Serial.print(',');
+    }
+    Serial.println();
+    Serial.print("Received: ");
+    Serial.print(start_frequency);
+    Serial.print(',');
+    Serial.print(stop_frequency);
+    Serial.print(',');
+    Serial.println(steps);
+}

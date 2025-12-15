@@ -1,5 +1,17 @@
-# Scanning-Transfer-Cavity-Lock
+# Scanning-Transfer-Cavity-Lock (Updated)
 
+This repository is a fork of Sarthak Subhankar's Scanning-Transfer-Cavity-Lock repo at https://github.com/JQIamo/Scanning-Transfer-Cavity-Lock. The code recorded in this new repo contains the following updates:
+
+* Remote setpoint setting through USB-I2C protocol
+* Remote frequency ramping triggerable with a TTL signal
+* Integrated setpoint-finding mode
+* Programmed LED to indicate the device's status
+* Reorganized code to highlight the tunable variable for debugging and testing
+* Removed unused/obsolete code blocks
+
+The following is the original README file in Sarthak's repo.
+
+# Scanning-Transfer-Cavity-Lock (Original)
 This repository contains design files and software for the Scanning-Transfer-Cavity-Lock Arduino shield described in the paper 
 https://arxiv.org/abs/1810.07256.
 For more information about use and performance of the circuit please refer to the paper. The material in this git repository is mainly provided for convenience, and to allow readers to faithfully replicate circuits layouts and firmware used in our experiment.
